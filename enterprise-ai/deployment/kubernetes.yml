@@ -1,0 +1,192 @@
+---
+# RAG Service Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rag-service
+  namespace: ai-platform
+  labels:
+    app: rag-service
+    version: v1
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: rag-service
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0       # zero-downtime deploys
+  template:
+    metadata:
+      labels:
+        app: rag-service
+        version: v1
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8001"
+        prometheus.io/path: "/metrics"
+    spec:
+      containers:
+        - name: rag-service
+          image: ghcr.io/thefaisalkhan/rag-service:latest
+          ports:
+            - containerPort: 8000
+              name: http
+            - containerPort: 8001
+              name: metrics
+          env:
+            - name: OPENAI_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: llm-secrets
+                  key: openai-api-key
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: db-secrets
+                  key: url
+            - name: REDIS_URL
+              value: redis://redis-svc:6379/0
+          resources:
+            requests:
+              memory: "512Mi"
+              cpu: "250m"
+            limits:
+              memory: "1Gi"
+              cpu: "1000m"
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /health/ready
+              port: 8000
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            failureThreshold: 2
+---
+# Horizontal Pod Autoscaler
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: rag-service-hpa
+  namespace: ai-platform
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: rag-service
+  minReplicas: 2
+  maxReplicas: 20
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 80
+---
+# Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: rag-service-svc
+  namespace: ai-platform
+spec:
+  selector:
+    app: rag-service
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8000
+    - name: metrics
+      port: 8001
+      targetPort: 8001
+---
+# API Gateway Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api-gateway
+  namespace: ai-platform
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: api-gateway
+  template:
+    metadata:
+      labels:
+        app: api-gateway
+    spec:
+      containers:
+        - name: api-gateway
+          image: ghcr.io/thefaisalkhan/api-gateway:latest
+          ports:
+            - containerPort: 8080
+          env:
+            - name: JWT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: gateway-secrets
+                  key: jwt-secret
+            - name: RAG_SERVICE_URL
+              value: http://rag-service-svc:80
+          resources:
+            requests:
+              memory: "256Mi"
+              cpu: "100m"
+            limits:
+              memory: "512Mi"
+              cpu: "500m"
+---
+# Ingress
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: ai-platform-ingress
+  namespace: ai-platform
+  annotations:
+    nginx.ingress.kubernetes.io/rate-limit: "100"
+    nginx.ingress.kubernetes.io/rate-limit-window: "1m"
+    cert-manager.io/cluster-issuer: "letsencrypt-prod"
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts:
+        - api.myaiapp.com
+      secretName: tls-secret
+  rules:
+    - host: api.myaiapp.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: api-gateway-svc
+                port:
+                  number: 80
+---
+# Secrets (values managed by external-secrets or vault in prod)
+apiVersion: v1
+kind: Secret
+metadata:
+  name: llm-secrets
+  namespace: ai-platform
+type: Opaque
+stringData:
+  openai-api-key: "set-via-external-secrets"
+  anthropic-api-key: "set-via-external-secrets"
